@@ -1136,6 +1136,10 @@ fn test_requests_skip_canceled() {
     .unwrap();
 }
 
+#[cfg(all(
+    feature = "tokio",
+    not(any(feature = "async-std", feature = "actix-rt"))
+))]
 #[test]
 fn test_handle_large_number_of_requests() {
     let mut rt = Runtime::new().unwrap();
