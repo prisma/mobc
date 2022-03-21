@@ -5,23 +5,7 @@ a Semaphore to manage the pool rather than the original design that used channel
 
 A generic connection pool with async/await support.
 
-Inspired by r2d2 and Golang SQL package.
-
-<div>
-  <a href="https://travis-ci.com/github/importcjj/mobc">
-    <img src="https://travis-ci.com/importcjj/mobc.svg?branch=master" alt="travis ci" />
-  </a>
-<!-- Crates version -->
-  <a href="https://crates.io/crates/mobc">
-    <img src="https://img.shields.io/crates/v/mobc.svg?style=flat-square"
-    alt="Crates.io version" />
-  </a>
-<!-- Downloads -->
-<a href="https://crates.io/crates/mobc">
-<img src="https://img.shields.io/crates/d/mobc.svg?style=flat-square"
-    alt="Download" />
-</a>
-</div>
+Inspired by Deadpool, Sqlx, r2d2 and Golang SQL package.
 
 [Changelog](https://github.com/prisma/mobc/blob/main/CHANGELOG.md)
 
