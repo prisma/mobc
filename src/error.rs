@@ -25,7 +25,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Error::Inner(ref err) => write!(f, "{}", err),
-            Error::Timeout => write!(f, "Timed out in mobc"),
+            Error::Timeout => write!(f, "Time out in the connection pool"),
             Error::BadConn => write!(f, "Bad connection in mobc"),
             Error::PoolClosed => write!(f, "The pool is closed"),
         }
@@ -39,7 +39,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Error::Inner(ref err) => write!(f, "{:?}", err),
-            Error::Timeout => write!(f, "Timed out in mobc"),
+            Error::Timeout => write!(f, "Timed out in the connection pool"),
             Error::BadConn => write!(f, "Bad connection in mobc"),
             Error::PoolClosed => write!(f, "The pool is closed"),
         }
