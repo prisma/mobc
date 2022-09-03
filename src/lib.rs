@@ -64,33 +64,44 @@
 //!        rx.recv().await.unwrap();
 //!    }
 //!}
-//!
 //! ```
+//!
+//! # Metrics
+//!
+//! Mobc uses the metrics crate to expose the following metrics
+//!
+//! 1. Active Connections - The number of connections in use.
+//! 1. Idle Connections - The number of connections that are not being used
+//! 1. Wait Count - the number of processes waiting for a connection
+//! 1. Wait Duration - A cumulative histogram of the wait time for a connection
+//!
 
 #![cfg_attr(feature = "docs", feature(doc_cfg))]
 #![warn(missing_docs)]
 #![recursion_limit = "256"]
 mod config;
 
+mod error;
+mod metrics_utils;
 #[cfg(feature = "unstable")]
 #[cfg_attr(feature = "docs", doc(cfg(unstable)))]
 pub mod runtime;
 mod spawn;
 mod time;
 
+pub use error::Error;
+
 pub use async_trait::async_trait;
 pub use config::Builder;
 use config::{Config, InternalConfig, ShareConfig};
 use futures_channel::mpsc::{self, Receiver, Sender};
-use futures_channel::oneshot::{self, Sender as ReqSender};
 use futures_util::lock::{Mutex, MutexGuard};
 use futures_util::select;
 use futures_util::FutureExt;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use metrics::{decrement_gauge, gauge, histogram, increment_counter, increment_gauge};
 pub use spawn::spawn;
-use std::collections::VecDeque;
-use std::error;
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -98,63 +109,13 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 #[doc(hidden)]
 pub use time::{delay_for, interval};
+use tokio::sync::Semaphore;
+
+use metrics_utils::{ACTIVE_CONNECTIONS, WAIT_COUNT, WAIT_DURATION};
+
+use crate::metrics_utils::{CLOSED_TOTAL, IDLE_CONNECTIONS, OPENED_TOTAL, OPEN_CONNECTIONS};
 
 const CONNECTION_REQUEST_QUEUE_SIZE: usize = 10000;
-
-/// The error type returned by methods in this crate.
-pub enum Error<E> {
-    /// Manager Errors
-    Inner(E),
-    /// Timeout
-    Timeout,
-    /// BadConn
-    BadConn,
-}
-
-impl<E> From<E> for Error<E> {
-    fn from(e: E) -> Error<E> {
-        Error::Inner(e)
-    }
-}
-
-impl<E> fmt::Display for Error<E>
-where
-    E: fmt::Display + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Inner(ref err) => write!(f, "{}", err),
-            Error::Timeout => write!(f, "Timed out in mobc"),
-            Error::BadConn => write!(f, "Bad connection in mobc"),
-        }
-    }
-}
-
-impl<E> fmt::Debug for Error<E>
-where
-    E: fmt::Debug + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Inner(ref err) => write!(f, "{:?}", err),
-            Error::Timeout => write!(f, "Timed out in mobc"),
-            Error::BadConn => write!(f, "Bad connection in mobc"),
-        }
-    }
-}
-
-impl<E> error::Error for Error<E>
-where
-    E: error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            Error::Inner(ref err) => Some(err),
-            Error::Timeout => None,
-            Error::BadConn => None,
-        }
-    }
-}
 
 #[async_trait]
 /// A trait which provides connection-specific functionality.
@@ -193,6 +154,7 @@ struct SharedPool<M: Manager> {
     config: ShareConfig,
     manager: M,
     internals: Mutex<PoolInternals<M::Connection, M::Error>>,
+    semaphore: Semaphore,
 }
 
 struct Conn<C, E> {
@@ -208,6 +170,8 @@ struct Conn<C, E> {
 impl<C, E> Conn<C, E> {
     fn close(&self, internals: &mut MutexGuard<'_, PoolInternals<C, E>>) {
         internals.num_open -= 1;
+        decrement_gauge!(OPEN_CONNECTIONS, 1.0);
+        increment_counter!(CLOSED_TOTAL);
     }
 
     fn expired(&self, timeout: Option<Duration>) -> bool {
@@ -243,9 +207,7 @@ impl<C, E> Conn<C, E> {
 
 struct PoolInternals<C, E> {
     config: InternalConfig,
-    opener_ch: Sender<()>,
     free_conns: Vec<Conn<C, E>>,
-    conn_requests: VecDeque<ReqSender<Conn<C, E>>>,
     num_open: u64,
     max_lifetime_closed: u64,
     max_idle_lifetime_closed: u64,
@@ -313,16 +275,8 @@ impl fmt::Debug for State {
     }
 }
 
-#[derive(PartialEq)]
-enum GetStrategy {
-    CachedOrNewConn,
-    AlwaysNewConn,
-}
-
 impl<M: Manager> Drop for Pool<M> {
-    fn drop(&mut self) {
-        // println!("Pool dropped");
-    }
+    fn drop(&mut self) {}
 }
 
 impl<M: Manager> Pool<M> {
@@ -453,6 +407,7 @@ impl<M: Manager> Pool<M> {
         } else {
             config.max_open as usize
         };
+
         let (cleaner_ch_sender, cleaner_ch) =
             if config.max_lifetime.is_some() || config.max_idle_lifetime.is_some() {
                 let (cleaner_ch_sender, cleaner_ch) = mpsc::channel(1);
@@ -461,17 +416,16 @@ impl<M: Manager> Pool<M> {
                 (None, None)
             };
         let (opener_ch_sender, mut opener_ch) = mpsc::channel(max_open);
+
         let (share_config, internal_config) = config.split();
         let internals = Mutex::new(PoolInternals {
             config: internal_config,
             free_conns: vec![],
-            conn_requests: VecDeque::new(),
             num_open: 0,
             max_lifetime_closed: 0,
             max_idle_lifetime_closed: 0,
             wait_count: 0,
             max_idle_closed: 0,
-            opener_ch: opener_ch_sender,
             wait_duration: Duration::from_secs(0),
             cleaner_ch: cleaner_ch_sender,
         });
@@ -479,13 +433,7 @@ impl<M: Manager> Pool<M> {
             config: share_config,
             manager,
             internals,
-        });
-
-        let shared1 = Arc::downgrade(&shared);
-        shared.manager.spawn_task(async move {
-            while let Some(_) = opener_ch.next().await {
-                open_new_connection(&shared1).await;
-            }
+            semaphore: Semaphore::new(max_open),
         });
 
         if cleaner_ch.is_some() {
@@ -522,11 +470,11 @@ impl<M: Manager> Pool<M> {
         let config = &self.0.config;
         loop {
             try_times += 1;
-            match self.strategy_get(GetStrategy::CachedOrNewConn).await {
+            match self.get_connection().await {
                 Ok(conn) => return Ok(conn),
                 Err(Error::BadConn) => {
                     if try_times == config.max_bad_conn_retries {
-                        return self.strategy_get(GetStrategy::AlwaysNewConn).await;
+                        return self.get_connection().await;
                     }
                     continue;
                 }
@@ -535,39 +483,8 @@ impl<M: Manager> Pool<M> {
         }
     }
 
-    async fn strategy_get(&self, strategy: GetStrategy) -> Result<Connection<M>, Error<M::Error>> {
-        let mut c = self.inner_strategy_ctx(strategy).await?;
-
-        if !c.brand_new {
-            let mut internals = self.0.internals.lock().await;
-            if c.expired(internals.config.max_lifetime) {
-                c.close(&mut internals);
-                return Err(Error::BadConn);
-            }
-
-            if c.idle_expired(internals.config.max_idle_lifetime) {
-                c.close(&mut internals);
-                return Err(Error::BadConn);
-            }
-
-            let needs_health_check = self.0.config.health_check
-                && c.needs_health_check(self.0.config.health_check_interval);
-
-            if needs_health_check {
-                let raw = c.raw.take().unwrap();
-                match self.0.manager.check(raw).await {
-                    Ok(raw) => {
-                        c.last_checked_at = Instant::now();
-                        c.raw = Some(raw)
-                    }
-                    Err(_e) => {
-                        internals.num_open -= 1;
-                        return Err(Error::BadConn);
-                    }
-                }
-            }
-        }
-
+    async fn get_connection(&self) -> Result<Connection<M>, Error<M::Error>> {
+        let mut c = self.get_or_create_conn().await?;
         c.last_used_at = Instant::now();
 
         let conn = Connection {
@@ -575,42 +492,96 @@ impl<M: Manager> Pool<M> {
             conn: Some(c),
         };
 
+        increment_gauge!(ACTIVE_CONNECTIONS, 1.0);
+        decrement_gauge!(WAIT_COUNT, 1.0);
+
         Ok(conn)
     }
 
-    async fn inner_strategy_ctx(
+    async fn validate_conn(
         &self,
-        strategy: GetStrategy,
-    ) -> Result<Conn<M::Connection, M::Error>, Error<M::Error>> {
-        let mut internals = self.0.internals.lock().await;
-        let num_free = internals.free_conns.len();
-        if strategy == GetStrategy::CachedOrNewConn && num_free > 0 {
-            let c = internals.free_conns.swap_remove(0);
-            return Ok(c);
+        internals: &MutexGuard<'_, PoolInternals<M::Connection, M::Error>>,
+        conn: &mut Conn<M::Connection, M::Error>,
+    ) -> bool {
+        if conn.brand_new {
+            return true;
         }
 
-        if internals.config.max_open > 0 {
-            if internals.num_open >= internals.config.max_open {
-                let (req_sender, req_recv) = oneshot::channel();
-                internals.wait_count += 1;
-                internals.conn_requests.push_back(req_sender);
-                // release
-                drop(internals);
+        if conn.expired(internals.config.max_lifetime) {
+            return false;
+        }
 
-                let wait_start = Instant::now();
-                let conn = req_recv.await.unwrap();
-                let mut internals = self.0.internals.lock().await;
-                internals.wait_duration += wait_start.elapsed();
+        if conn.idle_expired(internals.config.max_idle_lifetime) {
+            return false;
+        }
 
+        let needs_health_check = self.0.config.health_check
+            && conn.needs_health_check(self.0.config.health_check_interval);
+
+        if needs_health_check {
+            let raw = conn.raw.take().unwrap();
+            match self.0.manager.check(raw).await {
+                Ok(raw) => {
+                    conn.last_checked_at = Instant::now();
+                    conn.raw = Some(raw)
+                }
+                Err(_e) => return false,
+            }
+        }
+        true
+    }
+
+    async fn get_or_create_conn(&self) -> Result<Conn<M::Connection, M::Error>, Error<M::Error>> {
+        let mut internals = self.0.internals.lock().await;
+        internals.wait_count += 1;
+        increment_gauge!(WAIT_COUNT, 1.0);
+        let wait_start = Instant::now();
+
+        drop(internals);
+        let permit = self
+            .0
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| Error::PoolClosed)?;
+
+        let mut internals = self.0.internals.lock().await;
+        internals.wait_duration += wait_start.elapsed();
+        histogram!(WAIT_DURATION, wait_start.elapsed());
+        let conn = internals.free_conns.pop();
+
+        if conn.is_some() {
+            let mut conn = conn.unwrap();
+            if self.validate_conn(&internals, &mut conn).await {
+                decrement_gauge!(IDLE_CONNECTIONS, 1.0);
+                permit.forget();
                 return Ok(conn);
+            } else {
+                conn.close(&mut internals);
             }
         }
 
-        log::debug!("get conn with manager create");
+        let create_r = self.open_new_connection(internals).await;
+
+        if create_r.is_ok() {
+            decrement_gauge!(IDLE_CONNECTIONS, 1.0);
+            permit.forget();
+        }
+
+        create_r
+    }
+
+    async fn open_new_connection(
+        &self,
+        mut internals: MutexGuard<'_, PoolInternals<M::Connection, M::Error>>,
+    ) -> Result<Conn<M::Connection, M::Error>, Error<M::Error>> {
+        log::debug!("creating new connection from manager");
         match self.0.manager.connect().await {
             Ok(c) => {
                 internals.num_open += 1;
                 drop(internals);
+                increment_gauge!(OPENED_TOTAL, 1.0);
+                increment_counter!(OPEN_CONNECTIONS);
 
                 let conn = Conn {
                     raw: Some(c),
@@ -621,12 +592,9 @@ impl<M: Manager> Pool<M> {
                     brand_new: true,
                 };
 
-                return Ok(conn);
+                Ok(conn)
             }
-            Err(e) => {
-                maybe_open_new_connection(&self.0, internals).await;
-                return Err(Error::Inner(e));
-            }
+            Err(e) => Err(Error::Inner(e)),
         }
     }
 
@@ -654,35 +622,7 @@ async fn recycle_conn<M: Manager>(
     conn: Conn<M::Connection, M::Error>,
 ) {
     let internals = shared.internals.lock().await;
-    put_conn(&shared, internals, conn).await;
-}
-
-async fn open_new_connection<M: Manager>(shared: &Weak<SharedPool<M>>) {
-    let shared = match shared.upgrade() {
-        Some(shared) => shared,
-        None => return,
-    };
-
-    let create_r = shared.manager.connect().await;
-    let mut internals = shared.internals.lock().await;
-
-    match create_r {
-        Ok(c) => {
-            let conn = Conn {
-                raw: Some(c),
-                last_err: Mutex::new(None),
-                created_at: Instant::now(),
-                last_used_at: Instant::now(),
-                last_checked_at: Instant::now(),
-                brand_new: true,
-            };
-            return put_conn(&shared, internals, conn).await;
-        }
-        Err(_) => {
-            internals.num_open -= 1;
-            return maybe_open_new_connection(&shared, internals).await;
-        }
-    };
+    put_conn(shared, internals, conn).await;
 }
 
 async fn put_conn<M: Manager>(
@@ -690,40 +630,30 @@ async fn put_conn<M: Manager>(
     mut internals: MutexGuard<'_, PoolInternals<M::Connection, M::Error>>,
     mut conn: Conn<M::Connection, M::Error>,
 ) {
-    if conn.raw.is_none() {
+    if conn_still_valid(shared, &mut conn) {
+        conn.brand_new = false;
+        put_idle_conn(shared, internals, conn);
+    } else {
         conn.close(&mut internals);
-        return maybe_open_new_connection(shared, internals).await;
     }
 
-    if internals.config.max_open > 0 && internals.num_open > internals.config.max_open {
-        conn.close(&mut internals);
-        return;
+    shared.semaphore.add_permits(1);
+}
+
+fn conn_still_valid<M: Manager>(
+    shared: &Arc<SharedPool<M>>,
+    conn: &mut Conn<M::Connection, M::Error>,
+) -> bool {
+    if conn.raw.is_none() {
+        return false;
     }
 
     if !shared.manager.validate(conn.raw.as_mut().unwrap()) {
         log::debug!("bad conn when check in");
-        conn.close(&mut internals);
-        return maybe_open_new_connection(shared, internals).await;
+        return false;
     }
 
-    conn.brand_new = false;
-
-    while internals.conn_requests.len() > 0 {
-        let req = internals.conn_requests.pop_front().unwrap();
-        internals.wait_count -= 1;
-
-        if req.is_canceled() {
-            continue;
-        }
-
-        if let Err(c) = req.send(conn) {
-            conn = c;
-            continue;
-        }
-        return;
-    }
-
-    return put_idle_conn(shared, internals, conn);
+    true
 }
 
 fn put_idle_conn<M: Manager>(
@@ -739,26 +669,6 @@ fn put_idle_conn<M: Manager>(
     }
 }
 
-async fn maybe_open_new_connection<M: Manager>(
-    _shared: &Arc<SharedPool<M>>,
-    mut internals: MutexGuard<'_, PoolInternals<M::Connection, M::Error>>,
-) {
-    let mut num_requests = internals.conn_requests.len() as u64;
-    if internals.config.max_open > 0 {
-        let num_can_open = internals.config.max_open - internals.num_open;
-        if num_requests > num_can_open {
-            num_requests = num_can_open;
-        }
-    }
-
-    while num_requests > 0 {
-        internals.num_open += 1;
-        num_requests -= 1;
-        // FIXME
-        let _ = internals.opener_ch.send(());
-    }
-}
-
 async fn connection_cleaner<M: Manager>(
     shared: Weak<SharedPool<M>>,
     mut cleaner_ch: Receiver<()>,
@@ -766,7 +676,6 @@ async fn connection_cleaner<M: Manager>(
 ) {
     let mut interval = interval(clean_rate);
     interval.tick().await;
-
     loop {
         select! {
             _ = interval.tick().fuse() => (),
@@ -842,12 +751,14 @@ async fn clean_connection<M: Manager>(shared: &Weak<SharedPool<M>>) -> bool {
     for conn in closing {
         conn.close(&mut internals);
     }
+
     internals.max_idle_lifetime_closed += idle_closing.len() as u64;
     for conn in idle_closing {
         conn.close(&mut internals);
     }
 
     return true;
+
 }
 
 /// A smart pointer wrapping a connection.
@@ -872,6 +783,12 @@ impl<M: Manager> Drop for Connection<M> {
     fn drop(&mut self) {
         let pool = self.pool.take().unwrap();
         let conn = self.conn.take().unwrap();
+        // We change the metrics here instead of in the recycle_conn
+        // in case there is a specific tracing dispatcher for this future
+        // if we change the metrics in the spawn_task the dispatcher will be
+        // lost
+        decrement_gauge!(ACTIVE_CONNECTIONS, 1.0);
+        increment_gauge!(IDLE_CONNECTIONS, 1.0);
         // FIXME: No clone!
         pool.clone().0.manager.spawn_task(async move {
             recycle_conn(&pool.0, conn).await;
@@ -882,7 +799,7 @@ impl<M: Manager> Drop for Connection<M> {
 impl<M: Manager> Deref for Connection<M> {
     type Target = M::Connection;
     fn deref(&self) -> &Self::Target {
-        &self.conn.as_ref().unwrap().raw.as_ref().unwrap()
+        self.conn.as_ref().unwrap().raw.as_ref().unwrap()
     }
 }
 
